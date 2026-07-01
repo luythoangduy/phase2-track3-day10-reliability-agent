@@ -62,7 +62,23 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
     where "ts" is time.time() (epoch seconds).
     """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times: list[float] = []
+    for breaker in gateway.breakers.values():
+        opened_ts: float | None = None
+        for entry in breaker.transition_log:
+            transition_to = entry.get("to")
+            ts = entry.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            if transition_to == "open":
+                opened_ts = float(ts)
+            elif transition_to == "closed" and opened_ts is not None:
+                recovery_times.append((float(ts) - opened_ts) * 1000)
+                opened_ts = None
+
+    if not recovery_times:
+        return None
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
@@ -86,7 +102,46 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
     6. Return metrics
     """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    metrics = RunMetrics()
+
+    if not queries:
+        return metrics
+
+    for _ in range(config.load_test.requests):
+        prompt = random.choice(queries)
+        metrics.total_requests += 1
+        try:
+            result = gateway.complete(prompt)
+        except Exception:
+            metrics.failed_requests += 1
+            continue
+
+        metrics.estimated_cost += result.estimated_cost
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+
+        if result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        else:
+            metrics.successful_requests += 1
+
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
+
+    metrics.circuit_open_count = sum(
+        1
+        for breaker in gateway.breakers.values()
+        for entry in breaker.transition_log
+        if entry.get("to") == "open"
+    )
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
@@ -105,9 +160,18 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        if scenario.name == "primary_timeout_100":
+            passed = (
+                result.availability >= 0.9
+                and result.fallback_successes > 0
+                and result.circuit_open_count > 0
+            )
+        elif scenario.name == "primary_flaky_50":
+            passed = result.availability >= 0.8 and result.fallback_successes > 0
+        elif scenario.name == "all_healthy":
+            passed = result.availability >= 0.95
+        else:
+            passed = result.successful_requests > 0
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
